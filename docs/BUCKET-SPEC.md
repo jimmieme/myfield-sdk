@@ -1,23 +1,34 @@
-# @myfield/sdk Bucket Spec (v1)
+# @myfield/sdk Bucket Spec
 
-This document is for SDK maintainers and future language-port implementers,
-not for app developers using the root `@myfield/sdk` API. It specifies the
-encrypted bucket format that SDK versions and compatible ports must reproduce
-to read the same local/cloud data. The worker stores ciphertext and validates
-transport shape; it does not interpret this plaintext format.
+This specification describes the published Local format (0.9.1). Local merge and
+reserved-field semantics live inside encrypted sync content. The Worker stores and serves metadata/
+payload bytes without interpreting that application data.
 
-App-facing API semantics live in `docs/API.md`.
+See [API usage](API.md), [generated reference](api/index.md), and
+[documentation index](README.md).
 
-## Payload
+## Published Local Format (0.9.1)
+
+The following encoding and merge rules are already present in the published SDK.
+They remain unchanged for existing Local data and callers. Local IndexedDB stores
+decoded records; encryption is applied before synchronization.
+
+### Payload
 
 Plaintext layout before encryption:
 
 ```text
 byte 0        format version (0x01)
-bytes 1..end  UTF-8 JSON body
+bytes 1..4    uint32 big-endian JSON header length
+next bytes    UTF-8 JSON header
+remaining     zero or more [uint32 big-endian part length][raw part bytes]
 ```
 
-Decoders reject unknown version bytes. Version 1 body is one of:
+Decoders reject unknown version bytes, invalid lengths and invalid part references.
+The JSON header contains binary references of shape
+`{__myfieldSdkType: "binary-part-v1", part, size, mimeType?, name?, lastModified?}`.
+`part` is a zero-based part index; `size` must match its byte length. After restoring
+binary values, the document body is one of:
 
 ```jsonc
 {
@@ -40,7 +51,7 @@ or:
 `opaque` is for internal/custom merge strategies. It is not exposed by the
 v1 root package facade.
 
-## LWW-Map Merge
+### LWW-Map Merge
 
 Merge is state-based and must be commutative, associative, and idempotent.
 
@@ -65,18 +76,18 @@ Unknown keys are kept, so the body can grow without a format-byte bump:
 Deleting a field writes a tombstone and removes the field entry; rewriting a
 field removes its tombstone.
 
-## Clock
+### Clock
 
 Each bucket client has an actor id. Field timestamps use a hybrid clock:
 
 ```text
-ts = max(local wall clock in ms, max observed ts + 1)
+ts = max(local wall clock in ms + 1, max observed ts + 1)
 ```
 
 Observed timestamps include every field and tombstone in docs the client has
 read or merged. This prevents a slow device clock from losing all merges.
 
-## Reserved Object And Field Names
+### Reserved Object And Field Names
 
 The root package facade reserves app object ids and field names starting with
 `~`.
@@ -85,7 +96,7 @@ The root package facade reserves app object ids and field names starting with
   It maps a blinded object back to its app id without an index. It must
   derive to the object's wire id and match the local app id; otherwise the
   object is a sync error and is neither adopted nor pushed.
-- `~deleted`: the deleted marker for object tombstones.
+- `~deleted`: the encrypted Local object-deletion marker written by bucket.delete().
 - `~index`: a local-only index behind `list()`, never pushed. Entries are
   `{ updatedAt, rev, deleted? }`; a pulled object's `updatedAt` is its
   latest field or tombstone timestamp.
@@ -94,7 +105,7 @@ Apps cannot write these names through `put()` / `update()` / `delete()`.
 Lower-level source modules must preserve the same reservations when used by
 facade code.
 
-## Object Id Blinding
+### Object Id Blinding
 
 Apps address objects by semantic ids. The worker only sees blinded ids:
 
@@ -117,7 +128,7 @@ The mapping is deterministic for every authorized device and one-way for the
 platform. The semantic app object id must not be sent in URL paths, headers,
 or plaintext metadata.
 
-## Encryption Envelope
+### Encryption Envelope
 
 Object payloads use the established bucket sync envelope shape:
 
@@ -134,9 +145,11 @@ The SDK uses direct-bucket-key mode: `wrappedDEK` is the key id and
 `wrappedDEKMeta.alg` is `"direct-bucket-key"`.
 
 Worker-visible version metadata is transport metadata only. LWW timestamps,
-field names, object semantics, and app metadata live inside ciphertext.
+field names, object semantics, and app metadata live inside ciphertext. The legacy
+contentHash is FNV-1a32 of the encoded plaintext and remains a visible fingerprint;
+this release preserves it for compatibility.
 
-## Bucket Keys
+### Bucket Keys
 
 The authorization callback provides a bucket access grant. Its envelope wraps
 a raw 256-bit bucket key to the instance wrapping key using ECDH P-256,
@@ -149,7 +162,7 @@ The SDK derives:
 
 Raw key bytes are zeroed after derivation.
 
-## Sync Behavior Relevant To Format
+### Sync Behavior Relevant To Format
 
 The worker is a relay: it never decrypts payloads, but lists current
 heads by wire id (`GET objects:index` snapshot plus `GET feed`).
@@ -159,10 +172,11 @@ conflict and re-creating it from local state on a remote miss.
 
 A sync pass:
 
-1. Read `objects:index`, then `feed` from its `feedCursor` (or from the
-   start) until `hasMoreFeed` is false; later entries win. Result: wire id
-   to current version id. No cursor is persisted.
+1. Read `objects:index`; if `hasMoreFeed`, read `feed` from its `feedCursor`
+   (or from the start) until a page returns `hasMore: false` or the cursor stops
+   advancing. Later entries win. No cursor is persisted.
 2. Sync each local object (not `~index`) that changed remotely, is dirty,
    or is missing from the result.
-3. For each unknown wire id, decrypt the payload, read `~id`, and sync it;
-   skip it until a later pass if unresolved.
+3. For each unknown wire id, decrypt the payload, read `~id`, and sync it.
+   Unresolved IDs are skipped at the same version for this client's lifetime;
+   failed attempts that throw may retry on a later pass.

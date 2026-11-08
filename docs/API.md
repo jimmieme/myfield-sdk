@@ -1,211 +1,210 @@
-# @myfield/sdk API (v1 draft)
+# @myfield/sdk API Guide
 
-`@myfield/sdk` exposes a local-first encrypted object bucket. Local reads and
-writes work without an account. `connect()` binds the bucket to Myfield auth and
-encrypted sync.
+Local manages storage, encryption, merge and sync; Remote exposes authorization and
+HTTP operations. The excerpts below come from the runnable [Local](../examples/local-api.js)
+and [Remote](../examples/remote-api.js) pages. See [README](../README.md#examples) to run
+them, and [API Reference](api/index.md) for full signatures.
 
-## Quickstart
+## Local API
 
-```ts
-import { createInstance } from "@myfield/sdk";
+### 1. Initialize
 
-const instance = createInstance();
-const bucket = instance.createBucket({ id: "app.example.com" });
-
-await bucket.put("note:1", { title: "hello", body: "world" });
-const note = await bucket.get("note:1");
-const notes = await bucket.list({ prefix: "note:" });
-
-await bucket.connect();
+```js
+// Omitted authBase uses https://myfield.one/auth/.
+const instance = createInstance("local-api.example.com", { authBase });
+const bucket = instance.bucket;
 ```
 
-## `createInstance(options?)`
+Handles are synchronous and perform no I/O. By default, appId is the namespace
+and local bucket ID; reopening it reuses saved data and identity. Storage opens on first use.
 
-```ts
-function createInstance(options?: {
-  namespace?: string;                // default "default"
-  storage?: "indexeddb" | "memory";  // default "indexeddb"
-}): Instance;
-```
+### 2. Read and Save
 
-- `namespace` is a local storage scope. It defaults to `"default"` and must
-  match `a-z0-9`, max 32 chars.
-- `storage: "indexeddb"` persists local data, instance keys, auth context, and
-  sync metadata.
-- `storage: "memory"` keeps all state process-local and ephemeral.
+Local reads and writes work without authorization or network access. Missing/deleted
+objects return null. The example protects unsaved edits and writes only on Save:
 
-## `instance.createBucket(options)`
+```js
+async function readNote() {
+  const note = await bucket.get("note:1");
+  if (!dirty) editor.value = note?.text ?? "";
+}
 
-```ts
-instance.createBucket(options: { id: string }): Bucket;
-```
-
-- `id` is required. Use a stable domain-shaped id, usually the app host, for
-  example `"app.example.com"`.
-- Creating a bucket is local-only: no network and no account.
-- The local bucket id is the user-facing resource label. Myfield may bind it to
-  a different remote bucket id during `connect()`; apps must not assume they
-  are the same.
-- Valid ids use lowercase `a-z0-9`, `.`, and `-`, max 63 chars.
-
-## Local Object API
-
-Local operations work before `connect()` and never wait for network sync.
-
-```ts
-bucket.ready(): Promise<void>;
-
-bucket.put(id: string, object: Record<string, unknown>): Promise<void>;
-bucket.update(id: string, fields: Record<string, unknown>): Promise<void>;
-bucket.delete(id: string): Promise<void>;
-
-bucket.get(id: string): Promise<Record<string, unknown> | null>;
-bucket.binary(input: Blob | File | ArrayBuffer | Uint8Array, options?: {
-  mimeType?: string;
-  name?: string;
-  lastModified?: number;
-}): BucketBinaryValue;
-bucket.list(options?: {
-  prefix?: string;
-  includeDeleted?: boolean; // default false
-}): Promise<Array<{ id: string; updatedAt: string; deleted?: true }>>;
-```
-
-### Write Semantics
-
-- `put(id, object)` writes a whole object from this device's point of view.
-  Omitted fields that this device already knows are deleted; fields unknown
-  locally, such as concurrent remote additions, are preserved on merge.
-- `update(id, fields)` writes top-level fields and preserves omitted fields.
-  Setting a field to `undefined` deletes it. Updating a missing/deleted object
-  recreates it.
-- Unchanged field values do not advance field timestamps.
-- Merge granularity is top-level fields. Nested values are replaced wholesale.
-
-### Binary Fields
-
-Binary content is stored as a typed field value. The SDK does not interpret file
-semantics; app-owned fields such as `name`, `mimeType`, `size`, or `kind` remain
-ordinary application data.
-
-```ts
-await bucket.put("file:1", {
-  kind: "file",
-  name: file.name,
-  mimeType: file.type,
-  size: file.size,
-  content: bucket.binary(file),
+save.onclick = () => action(async () => {
+  await bucket.put("note:1", { text: editor.value });
+  dirty = false;
+  status.textContent = "Saved locally";
 });
+```
 
-const saved = await bucket.get("file:1");
-const content = saved?.content;
-if (content?.kind === "binary") {
-  const blob = await content.blob();
-  const bytes = await content.arrayBuffer();
+Save confirms local persistence, not upload. `bucket.on("change")` reports local
+changes, including applied remote data, so the page can re-read the note.
+
+### 3. Connect
+
+After the first local read, start `instance.resume()` in the background to handle
+callbacks and restore saved access without prompting. Connect is a user action:
+
+```js
+connect.onclick = () => action(() => instance.connect());
+```
+
+`connect()` reuses access or opens authorization when none is saved. Connection
+failures retain authorization for `resume()` to retry; disconnect before authorizing again.
+
+## Remote API
+
+This example owns storage and a text codec, without merge, auto-sync or discovery.
+
+### 1. Initialize
+
+The page saves its key, object ID and grant using `createAuthorizationStorage` with
+app-owned IndexedDB. It creates keys only when no record exists; concurrent loads
+reuse the first inserted record. Invalid records stop without replacement.
+Supply the saved key to `createInstance`; Remote shares that identity:
+
+```js
+instance = createInstance(appId, { instanceKey: record.instanceKey, authBase, authStorage: { database, store: "example" } });
+```
+
+### 2. Read and Save
+
+After connecting (step 3), find the head, fetch its fixed version, then decode.
+Remote uses wire IDs directly:
+
+```js
+async function readNote(client, grant) {
+  const head = await client.getCurrent(record.objectId);
+  let data = null;
+  if (head) {
+    const version = await client.getVersion(record.objectId, head.versionId);
+    data = await decodeNoteVersion(version, grant);
+  }
+  if (!dirty) editor.value = data === null ? "" : new TextDecoder().decode(data);
+  headVersionId = head?.versionId ?? null;
+  status.textContent = "Loaded from remote";
 }
 ```
 
-`bucket.binary()` accepts `Blob`, `File`, `ArrayBuffer`, and `Uint8Array`.
-Read-side binary values expose:
+Missing current returns null; missing fixed versions throw. `getVersion()` fetches
+metadata and payload in parallel and returns `{ meta, payload: Response }`; consume
+or cancel the body. Both can also be fetched separately.
 
-```ts
-type BucketBinaryValue = {
-  kind: "binary";
-  size: number;
-  mimeType?: string;
-  name?: string;
-  lastModified?: number;
-  blob(): Promise<Blob>;
-  arrayBuffer(): Promise<ArrayBuffer>;
-};
+For Save, construct encrypted bytes and metadata, then commit against the observed head:
+
+```js
+const version = await encodeNoteVersion({
+  objectId: record.objectId, parentVersionIds: headVersionId ? [headVersionId] : [],
+  data: encoder.encode(editor.value),
+}, record.grant);
+const result = await remote.commit({ ...version, expectedHeadVersionId: headVersionId });
+if (!result.ok) throw new Error("Remote note changed. Reload before saving.");
 ```
 
-Binary fields are inline in the same encrypted SDK object payload. They use the
-same field-level LWW ordering as other fields. The worker API is unchanged and
-continues to see only opaque encrypted object payloads.
+Upload accepts `Blob` or `Uint8Array`. CAS rejection returns `{ ok: false, reason }`;
+other failures throw [ClientError](api/ClientError.md). The page advances its head only
+on success, and catches failures to pause writes and preserve edits. It has no durable
+pending/confirmation: copy text before reload. Unknown/malformed ACKs and `retryable`
+never prove the outcome; retain fixed bytes/meta/version ID after uncertain writes.
 
-The SDK enforces a 100 MiB (`100 * 1024 * 1024` bytes) object-level encoded
-payload size cap. Apps requiring larger data should model chunks as separate objects; chunking is
-application-owned and is not a public SDK API concept.
+The [note codec](../examples/note-codec.js) encrypts UTF-8 text using the existing
+JSON/AES-GCM envelope; Local encrypts LWW state. Encryption authenticates bucket/object,
+not version/parents. Those checks only ensure consistency; unkeyed `payloadHash`
+cannot prevent repackaging old ciphertext under new IDs. Apps own `{ meta, payload }`
+codecs; SDK body codecs/new schemas are deferred.
 
-### Read And List
+### 3. Connect
 
-- `get(id)` returns the local object or `null` when absent, deleted, or not
-  locally available.
-- `list()` returns the local known-object index, newest first. It is not a
-  query/search API. Objects from other devices appear once a sync pulls
-  them; their `change` event fires after `list()` includes them.
-- Object ids and field names starting with `~` are reserved and rejected.
+The Connect handler reuses a saved grant or opens authorization, saves new access,
+then calls `openRemote`:
 
-## Connection API
-
-```ts
-bucket.resume(): Promise<void>;
-
-bucket.connect(options?: {
-  authBase?: string;  // default "https://myfield.one/auth/"
-  autoSync?: boolean; // default true
-}): Promise<void>;
-
-bucket.sync(): Promise<void>;
-bucket.setAutoSync(enabled: boolean): void;
-bucket.disconnect(): Promise<void>;
-
-bucket.state; // "disconnected" | "connecting" | "connected"
-
-const offState = bucket.on("state", (state, detail?) => {});
-const offChange = bucket.on("change", (objectId) => {});
-```
-
-- Call `resume()` on app boot. It completes pending auth callbacks and restores
-  existing authorization without prompting.
-- Call `connect()` from a user gesture. It may open the Myfield auth page.
-- `authBase` defaults to `https://myfield.one/auth/`. API endpoints are not
-  public SDK options.
-- With `autoSync`, the SDK syncs after connecting and after local writes.
-- Browser lifecycle sync is app-owned. Apps may call `bucket.sync()` on focus,
-  visibility, or online events.
-- `disconnect()` drops the remote binding and authorization. Local data stays.
-
-## Events
-
-```ts
-bucket.on("state", (state, detail) => {
-  // state: "disconnected" | "connecting" | "connected"
-});
-
-bucket.on("change", (objectId) => {
-  // Re-read with bucket.get(objectId)
+```js
+connect.onclick = () => action(async () => {
+  if (remote) return;
+  const grant = record.grant ?? await instance.remote.auth.authorize({ mode: "popup" });
+  if (!record.grant) {
+    const next = { ...record, grant };
+    await storage.set("note", next);
+    record = next;
+  }
+  await openRemote(grant);
 });
 ```
 
-The returned function unsubscribes the listener.
+`openRemote` binds access before reading:
 
-## Errors
+```js
+const server = instance.remote;
+server.bind(grant);
+const client = server.bucket;
+```
 
-- Invalid bucket ids, object ids, field names, or oversized objects reject the
-  returned promise.
-- `sync()` while disconnected rejects with `NotConnectedError`.
-- Retryable sync failures, such as offline, rate limits, or 5xx responses, are
-  surfaced through state details and retried by auto-sync.
-- A cloud miss is not an error. `get()` returns `null`, and another device that
-  still has the object can re-upload it on sync.
+Startup also calls `openRemote` when a grant is saved. For same-tab callbacks, it
+first calls `instance.remote.auth.handleCallback()` and saves the returned grant;
+without a callback, it returns null. Apps save grants; Remote binds them in memory.
 
-## Boundaries
+## Connection and Lifecycle
 
-- Myfield sync is a relay, not a backup. Apps should keep their own export or
-  durability story when user data must be archival.
-- Content and object ids are encrypted/blinded before reaching Myfield. Traffic
-  timing, sizes, and counts are still visible to the platform.
-- Web clients cannot hide the browser `Origin` header from sync/auth requests.
-- v1 is freshness sync, not realtime collaborative editing.
+| API | Behavior |
+| --- | --- |
+| `instance.on("state")` | Reports Local connection status and details. |
+| `instance.getSession()` | Uses saved access without prompting or processing callbacks. |
+| `instance.disconnect()` | Clears Local authorization and stops sync; retains identity and objects. |
+| `instance.dispose()` | Stops owned runtime work without deleting saved data. |
+| `remote.bind(grant)` / `unbind()` | Atomically sets or clears in-memory access; does not persist or revoke grants. |
 
-## Not In V1
+Binding sets read-only `remote.authorization` and `remote.apiBase`; unbound
+authorization is null. `instance.instanceKey` is null until supplied, restored or
+created. Remote caches sessions in memory and coalesces refresh before expiry.
+Rebinding/unbinding clears sessions and rejects late credentials from old bindings;
+there is no public credential provider.
 
-- Custom storage adapters.
-- Query, pagination, ordering, or full-text search.
-- Public subpaths such as `@myfield/sdk/auth` or `@myfield/sdk/bucket`.
-- Capability negotiation APIs.
-- External KV mutation detection.
-- Public feed, batch, snapshot, or version-history APIs.
-- `setFields()` / `getFields()` as the quickstart path.
+## Authorization Modes
+
+| Operation | Behavior |
+| --- | --- |
+| `remote.auth.authorize({ mode: "popup" })` | Opens a popup and returns a grant. |
+| `remote.auth.authorize({ mode: "redirect" })` | Saves identity/pending in IndexedDB, navigates, returns void. |
+| `remote.auth.handleCallback()` | Restores/verifies URL/pending and cleans them on success. Returns a grant, or null without a callback. |
+
+Remote returns grants without saving/binding them. Redirects use `authStorage` or the
+default store; memory-only storage throws `AUTH_STORAGE_REQUIRED`. Invalid/expired/
+unmatched callbacks fail without UI. New authorization cancels the same Instance's
+old flow/popup (`AUTHORIZATION_CANCELLED`) and overwrites pending per resource/identity.
+Repeated Local connect joins. Blocked popups report `AUTHORIZATION_BLOCKED`; Local
+may fall back to redirect.
+
+`authBase` defaults to `https://myfield.one/auth/`; `apiBase` comes from the grant,
+without host inference. Standalone clients require an explicit HTTP(S) origin.
+`createAuthorizationClient` provides pure request/callback operations;
+`createSessionClient` handles challenge/sign/exchange without storage/cache/refresh.
+
+## Compatibility and Ownership
+
+- Local retains 0.9.1 IndexedDB records, JSON encryption, ID blinding, LWW merge
+  and encrypted app-level deletion. Existing namespace-based calls remain supported.
+  Keep namespace and bucket ID when adopting the appId constructor; defaults do not
+  move existing data. `createBucket({ id })` retains isolated buckets.
+- Instance owns lifecycle/state; Bucket owns data/change events. Legacy
+  `bucket.resume/state/events` remain supported. `bucket.connect/disconnect` are
+  deprecated; bucket connect returns state on auth failure where Instance throws.
+  `bucket.ready()` is a deprecated no-op; storage errors surface on first use.
+- Local operations/published access block `bind/unbind` (`REMOTE_MANAGED`);
+  externally bound access requires unbind before Local takes over (`REMOTE_BOUND`).
+  Failures preserve published access; disconnect invalidates pending operations.
+  Resume without saved access/callbacks does not claim Remote.
+- [CommitSchema](api/CommitSchema.md) selects HTTP encoding, not encryption.
+  Remote forwards opaque bytes without deletion semantics. Current non-legacy
+  Worker validation requires a parent and no `payloadHash` for empty content;
+  other empty commits return 400. The example encrypts empty text; cloud records remain.
+
+## History, Feed and Cancellation
+
+- `getCurrent(objectId, { have })` evidence is newest-first through `have`: non-empty
+  proves ancestry, `[]` provides no proof, and null means incomplete/bounded evidence.
+  Omitting `have` skips history. `listVersionHistory()` lists commits, not an ancestor graph.
+- Index/feed pagination uses explicit cursors; null starts at the beginning.
+  `watchFeed()` opens one SSE connection on iteration and yields ready before hints.
+  Catch up feed after ready and on hints; stream end does not prove catch-up.
+- Requests accept `signal` and clients accept injected `fetch`. Remote has no automatic
+  retry, pagination, reconnect or commit confirmation. See [BucketRemote](api/BucketRemote.md)
+  and [CreateInstanceOptions](api/CreateInstanceOptions.md) for signatures.

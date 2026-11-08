@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bucket-protocol.schema.json",
+  "title": "Bucket Protocol Structures",
+  "description": "Worker protocol metadata and legacy headState only; excludes decrypted Local payload fields. See ../BUCKET-SPEC.md#published-local-format-091 for the published Local tombstones and ~deleted structures. CommitSchema selects HTTP encoding, not application encryption.",
+  "$defs": {
+    "versionMeta": {
+      "type": "object",
+      "required": ["objectId", "versionId", "parentVersionIds"],
+      "properties": {
+        "objectId": { "type": "string", "minLength": 1 },
+        "versionId": { "type": "string", "minLength": 1 },
+        "parentVersionIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "payloadHash": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "legacyHeadState": {
+      "type": "object",
+      "required": ["headVersionId", "historyMap", "fieldSources"],
+      "properties": {
+        "headVersionId": { "type": "string", "minLength": 1 },
+        "historyMap": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "fieldSources": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "additionalProperties": true
+    }
+  }
+}
