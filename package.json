@@ -1,7 +1,7 @@
 {
   "name": "@myfield/sdk",
   "version": "0.9.2-alpha.0",
-  "description": "Myfield open SDK: instance auth and end-to-end-encrypted bucket sync for third-party web apps.",
+  "description": "MyField SDK: local-first encrypted sync and remote protocol clients for web applications.",
   "license": "Apache-2.0",
   "author": "OPENTECH AI PTE. LTD.",
   "homepage": "https://github.com/myfield-one/sdk",
@@ -29,6 +29,7 @@
     "src/",
     "types/",
     "docs/",
+    "examples/",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
@@ -40,19 +41,30 @@
     "myfield",
     "local-first",
     "encrypted-sync",
+    "remote-api",
+    "object-storage",
     "sdk"
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js",
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js && node scripts/api.mjs --build",
     "prepack": "npm run build",
     "test": "node --experimental-strip-types --test test/*.test.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:api": "tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext --target ES2022 test/protocol-consumer.ts",
+    "test:compat": "node --experimental-strip-types test/local-compatibility.mjs",
+    "test:live": "node --experimental-strip-types test/live-protocol.mjs",
+    "api:update": "node scripts/api.mjs --update",
+    "api:check": "node scripts/api.mjs",
+    "test:browser": "node test/browser.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
     "esbuild": "^0.28.1",
     "fake-indexeddb": "6.2.4",
-    "typescript": "5.5.4"
+    "typescript": "5.5.4",
+    "@microsoft/api-extractor": "^7.59.4",
+    "typedoc": "^0.28.20",
+    "typedoc-plugin-markdown": "^4.14.1"
   }
 }
