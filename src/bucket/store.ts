@@ -1,3 +1,4 @@
+import { createAuthStorage } from "../auth/storage.ts";
 // Minimal local persistence boundary. Local is the source of truth; the
 // cloud is a sync relay, not a backup. Apps may swap in their own adapter
 // (RxDB, SQLite, ...) — the SDK only needs get/set/remove/keys.
@@ -5,6 +6,7 @@
 export type StorageAdapter = {
   get<T = unknown>(key: string): Promise<T | null>;
   set(key: string, value: unknown): Promise<void>;
+  add?(key: string, value: unknown): Promise<boolean>;
   remove(key: string): Promise<void>;
   keys(prefix: string): Promise<string[]>;
 };
@@ -35,6 +37,11 @@ function memoryAdapterOver(map: Map<string, unknown>): StorageAdapter {
     async set(key: string, value: unknown): Promise<void> {
       map.set(key, structuredClone(value));
     },
+    async add(key: string, value: unknown): Promise<boolean> {
+      if (map.has(key)) return false;
+      map.set(key, structuredClone(value));
+      return true;
+    },
     async remove(key: string): Promise<void> {
       map.delete(key);
     },
@@ -51,6 +58,7 @@ export function createIndexedDbStorageAdapter(options: { dbName: string; storeNa
   const dbName = options.dbName;
   const storeName = options.storeName || "kv";
   return {
+    add: (key, value) => withIdb(dbName, storeName, db => createAuthStorage({ database: db, store: storeName }).add!(key, value)),
     get: <T>(key: string) =>
       withIdb<T | null>(dbName, storeName, (db) =>
         requestPromise<T | null>((resolve, reject) => {

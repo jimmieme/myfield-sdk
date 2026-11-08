@@ -42,8 +42,8 @@ test("listHeads reads the index snapshot, then the feed tail; later entries win"
       assert.deepEqual(Object.fromEntries(heads), { ob_a: "v3", ob_b: "v1", ob_c: "v1" });
       assert.deepEqual(requested, [
         "/v1/api/sync/buckets/b1/objects:index",
-        "/v1/api/sync/buckets/b1/feed?limit=100&cursor=c1",
-        "/v1/api/sync/buckets/b1/feed?limit=100&cursor=c2",
+        "/v1/api/sync/buckets/b1/feed?cursor=c1&limit=100",
+        "/v1/api/sync/buckets/b1/feed?cursor=c2&limit=100",
       ]);
     }
   ));
@@ -80,3 +80,15 @@ test("listHeads surfaces an unavailable index as a retryable error", () =>
       await assert.rejects(createTransport().listHeads(), (error) => error instanceof BucketTransportError && error.retryable);
     }
   ));
+
+test("Local transport never treats legacy ok:false as a successful upload", async () => {
+  const original = globalThis.fetch;
+  const payloadKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  globalThis.fetch = async () => Response.json({ ok: false, reason: "unavailable" });
+  try {
+    const transport = new BucketTransport({ apiBase: "https://api.example.test/v1/api/sync", mfid: "mf_test",
+      keys: { bucketId: "b1", keyId: "k1", payloadKey, wireObjectId: async id => id },
+      sessionProvider: { getSession: async () => ({ carrier: "bearer", token: "t" }) } });
+    await assert.rejects(transport.push("one", new Uint8Array([1]), null), error => error instanceof BucketTransportError && error.retryable && error.status === 503);
+  } finally { globalThis.fetch = original; }
+});

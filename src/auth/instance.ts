@@ -1,3 +1,9 @@
+import { authorizationContext } from "./context.ts";
+import type { AuthorizationContext, AuthorizationRequest } from "./client.ts";
+import { createInstanceKey, deriveInstanceId, type InstanceKey } from "../crypto/instance.ts";
+export { signInstanceChallenge } from "../crypto/instance.ts";
+import { createSessionClient, type InstanceSession } from "../remote/session.ts";
+import { ClientError } from "../errors.ts";
 // Instance auth client for the open surface, ported from the notepad
 // prototype and trimmed to the open contract:
 //   - bucket resources only, fixed read+write capabilities
@@ -24,15 +30,7 @@ import { createIndexedDbStorageAdapter, type StorageAdapter } from "../bucket/st
 
 export type AuthCapability = "read" | "write";
 
-export type AuthInstance = {
-  v: 1;
-  instanceId: string;
-  signingPublicJwk: JsonWebKey;
-  signingPrivateKey: CryptoKey;
-  wrappingPublicJwk: JsonWebKey;
-  wrappingPrivateKey: CryptoKey;
-  createdAt: string;
-};
+export type AuthInstance = InstanceKey;
 
 export type InstanceAuthContext = {
   v: 1;
@@ -70,6 +68,9 @@ export type InstanceAuthClientOptions = {
   openAuthUrl?: (url: string) => void | Promise<void>;
   storage?: StorageAdapter;
   fetchImpl?: typeof fetch;
+  instanceKey?: InstanceKey;
+  onIdentity?: (identity: InstanceKey) => void;
+  createSession?: (apiBase: string, identity: InstanceKey, input: { mfid: string; resourceId: string }) => Promise<InstanceSession>;
 };
 
 export type AuthCallbackResult = {
@@ -84,7 +85,9 @@ export type AuthCallbackResult = {
 export type InstanceAuthClient = {
   ensureInstance(): Promise<AuthInstance>;
   authorize(request: { bucketId: string }): Promise<void>;
-  handleCallback(url?: string): Promise<AuthCallbackResult | null>;
+  prepareAuthorization(request: { bucketId: string }, signal?: AbortSignal): Promise<AuthorizationRequest>;
+  cancelAuthorization(requestId: string): Promise<void>;
+  handleCallback(url?: string, options?: { persist?: boolean; signal?: AbortSignal }): Promise<(AuthCallbackResult & { authorization?: AuthorizationContext }) | null>;
   getContext(bucketId: string): Promise<InstanceAuthContext | null>;
   getSession(bucketId: string, options?: { forceRefresh?: boolean }): Promise<CloudSessionCredential>;
   getBucketAccess(bucketId: string): Promise<BucketAccess>;
@@ -133,6 +136,7 @@ type EncryptedAuthAuthorizationResultEnvelope = {
 };
 
 type PendingInstanceAuthRequest = {
+  redirectUri?: string;
   v: 1;
   requestId: string;
   state: string;
@@ -150,6 +154,8 @@ type InstanceAuthCallbackPointer = {
   createdAt: string;
 };
 
+const sessionRefreshes = new Map<string, Promise<CloudSessionCredential>>();
+
 type StoredAuthInstance = AuthInstance & { updatedAt: string };
 type ActiveInstancePointer = { v: 1; instanceId: string; updatedAt: string };
 
@@ -160,14 +166,6 @@ type StoredCloudSessionCredential = {
   instanceId: string;
   credential: CloudSessionCredential;
   storedAt?: string;
-};
-
-type InstanceProof = {
-  type: "instance.es256";
-  instanceId: string;
-  alg: "ES256";
-  signedAt: string;
-  signature: string;
 };
 
 const AUTH_REQUEST_TTL_MS = 10 * 60 * 1000;
@@ -183,8 +181,7 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
   const appId = normalizeInstanceAppId(options.appId);
   let mfid = "";
   let currentResourceId = "";
-  let currentSession: { resourceId: string; credential: CloudSessionCredential } | null = null;
-  const inFlightSessionRefreshes = new Map<string, Promise<CloudSessionCredential>>();
+  const sessions = new Map<string, CloudSessionCredential>();
   const storage = options.storage || createIndexedDbStorageAdapter({ dbName: DEFAULT_AUTH_IDB_NAME, storeName: "instance" });
   const fetchImpl = options.fetchImpl || fetch;
   const bucketAccessCache = new Map<string, { access: BucketAccess; expiresAt: number }>();
@@ -196,61 +193,71 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
   const contextKey = (resourceId: string, instanceId: string) => `instance:${seg(appId)}:context:${seg(resourceId)}:${seg(instanceId)}`;
   const sessionKey = (resourceId: string, instanceId: string) => `instance:${seg(appId)}:session:${seg(resourceId)}:${seg(instanceId)}`;
 
-  function isStoredAuthInstance(value: StoredAuthInstance | null, instanceId?: string): value is StoredAuthInstance {
+  function isStoredAuthInstance(value: AuthInstance | null, instanceId?: string): value is AuthInstance {
     return (
       !!value &&
       value.v === 1 &&
       isValidInstanceId(value.instanceId) &&
       (!instanceId || value.instanceId === instanceId) &&
       value.signingPrivateKey instanceof CryptoKey &&
-      value.wrappingPrivateKey instanceof CryptoKey
+      value.wrappingPrivateKey instanceof CryptoKey &&
+      value.signingPrivateKey.type === "private" && !value.signingPrivateKey.extractable &&
+      value.signingPrivateKey.algorithm.name === "ECDSA" && value.signingPrivateKey.usages.includes("sign") &&
+      value.wrappingPrivateKey.type === "private" && !value.wrappingPrivateKey.extractable &&
+      value.wrappingPrivateKey.algorithm.name === "ECDH" && value.wrappingPrivateKey.usages.includes("deriveBits") &&
+      !!value.signingPublicJwk && !!value.wrappingPublicJwk
     );
   }
 
   async function readStoredInstance(instanceId: string): Promise<StoredAuthInstance | null> {
     const stored = await storage.get<StoredAuthInstance>(instanceKey(instanceId));
-    return isStoredAuthInstance(stored, instanceId) ? stored : null;
-  }
-
-  async function writeStoredInstance(authInstance: AuthInstance): Promise<StoredAuthInstance> {
-    const existing = await readStoredInstance(authInstance.instanceId);
-    const stored: StoredAuthInstance = {
-      ...authInstance,
-      updatedAt: new Date().toISOString(),
-      createdAt: authInstance.createdAt || existing?.createdAt || new Date().toISOString(),
-    };
-    await storage.set(instanceKey(authInstance.instanceId), stored);
-    const verified = await readStoredInstance(authInstance.instanceId);
-    if (!verified) throw new Error("auth instance write did not persist keys");
-    await storage.set(activeInstanceKey(), { v: 1, instanceId: authInstance.instanceId, updatedAt: new Date().toISOString() } satisfies ActiveInstancePointer);
-    instance = verified;
-    return verified;
+    if (stored !== null && !isStoredAuthInstance(stored, instanceId)) throw new ClientError("INVALID_INSTANCE", "Stored instance keys are invalid");
+    return stored;
   }
 
   async function readActiveStoredInstance(): Promise<StoredAuthInstance | null> {
     const active = await storage.get<ActiveInstancePointer>(activeInstanceKey());
-    if (!active || active.v !== 1 || !isValidInstanceId(active.instanceId)) return null;
-    return readStoredInstance(active.instanceId);
+    if (active === null) return null;
+    if (active.v !== 1 || !isValidInstanceId(active.instanceId)) throw new ClientError("INVALID_INSTANCE", "Stored instance pointer is invalid");
+    const stored = await readStoredInstance(active.instanceId);
+    if (!stored) throw new ClientError("INVALID_INSTANCE", "Stored instance keys are missing");
+    return stored;
   }
 
-  async function ensureStoredInstance(): Promise<StoredAuthInstance> {
-    if (instance) {
-      const stored = await readStoredInstance(instance.instanceId);
-      if (stored) return stored;
-      return writeStoredInstance(instance);
-    }
-    const active = await readActiveStoredInstance();
-    if (active) {
-      instance = active;
-      return active;
-    }
-    return writeStoredInstance(await generateAuthInstance());
+  let initialization: Promise<StoredAuthInstance> | null = null;
+  function getInstanceKey(): Promise<StoredAuthInstance> {
+    if (initialization) return initialization;
+    initialization = (async () => {
+      const active = await readActiveStoredInstance();
+      if (active) {
+        if (options.instanceKey && options.instanceKey.instanceId !== active.instanceId) throw new ClientError("IDENTITY_MISMATCH", "A different instance is already stored");
+        options.onIdentity?.(active);
+        return instance = active;
+      }
+      const created = options.instanceKey ?? await createInstanceKey();
+      if (!isStoredAuthInstance(created) || created.instanceId !== await deriveInstanceId(created.signingPublicJwk)) throw new ClientError("INVALID_INPUT", "Invalid instance key");
+      const stored = { ...created, updatedAt: new Date().toISOString() };
+      await storage.set(instanceKey(created.instanceId), stored);
+      if (!await readStoredInstance(created.instanceId)) throw new ClientError("STORAGE_ERROR", "Instance keys did not persist");
+      const pointer: ActiveInstancePointer = { v: 1, instanceId: created.instanceId, updatedAt: stored.updatedAt };
+      const won = storage.add ? await storage.add(activeInstanceKey(), pointer)
+        : await storage.get(activeInstanceKey()) === null && (await storage.set(activeInstanceKey(), pointer), true);
+      if (won) { options.onIdentity?.(stored); return instance = stored; }
+      const winner = await readActiveStoredInstance();
+      if (!winner) throw new ClientError("STORAGE_ERROR", "Instance initialization lost its active pointer");
+      if (winner.instanceId !== created.instanceId) await storage.remove(instanceKey(created.instanceId));
+      if (options.instanceKey && options.instanceKey.instanceId !== winner.instanceId) throw new ClientError("IDENTITY_MISMATCH", "A different instance is already stored");
+      options.onIdentity?.(winner);
+      return instance = winner;
+    })().finally(() => { initialization = null; });
+    return initialization;
   }
 
   async function readContext(resourceId: string): Promise<InstanceAuthContext | null> {
     if (!parseBucketResourceId(resourceId)) return null;
     const authInstance = await readActiveStoredInstance();
     if (!authInstance) return null;
+    options.onIdentity?.(authInstance);
     const context = await storage.get<InstanceAuthContext>(contextKey(resourceId, authInstance.instanceId));
     if (
       !context ||
@@ -270,62 +277,51 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
 
   async function getSessionForResource(resourceId: string, sessionOptions?: { forceRefresh?: boolean }): Promise<CloudSessionCredential> {
     const context = await readContext(resourceId);
-    if (!mfid || !context) throw new Error("not authorized; complete an auth callback first");
-    const authInstance = await ensureStoredInstance();
+    if (!context) throw new ClientError("NOT_AUTHORIZED", "Authorize this bucket before requesting a session");
+    const mfid = context.mfid;
+    const authInstance = await getInstanceKey();
     if (authInstance.instanceId !== context.instanceId) throw new Error("stored instance does not match authorization context");
     const sessionResourceId = context.remoteResourceId || context.resourceId;
     const forceRefresh = sessionOptions?.forceRefresh === true;
-    const refreshSessionKey = `${sessionResourceId}:${authInstance.instanceId}`;
+    const apiBase = (context.resourceApiUrl || options.apiBase || browserLocationOrigin()).replace(/\/+$/, "").replace(/\/v1\/api\/sync$/, "");
+    const refreshSessionKey = JSON.stringify([apiBase, mfid, sessionResourceId, authInstance.instanceId, context.bucketAccessGrant?.grantRecordId]);
 
     const performRefreshSession = async (): Promise<CloudSessionCredential> => {
-      const challenge = await postJson<{ challengeId: string; challenge: string }>(fetchImpl, options.apiBase, "/v1/api/auth/instance-challenge", {
-        mfid,
-        resourceId: sessionResourceId,
-        instanceId: authInstance.instanceId,
-      });
-      const proof = await signInstanceChallenge({
-        instance: authInstance,
-        challengeId: challenge.challengeId,
-        challenge: challenge.challenge,
-        mfid,
-        resourceId: sessionResourceId,
-      });
-      const session = await postJson<{ credential: CloudSessionCredential }>(fetchImpl, options.apiBase, "/v1/api/auth/instance-session", {
-        mfid,
-        resourceId: sessionResourceId,
-        instanceId: authInstance.instanceId,
-        challengeId: challenge.challengeId,
-        proof,
-        credentialCarrier: "bearer",
-      });
-      currentSession = { resourceId: sessionResourceId, credential: session.credential };
-      if (session.credential.carrier === "bearer") {
-        await storage.set(sessionKey(sessionResourceId, context.instanceId), {
-          v: 1,
-          mfid,
-          resourceId: sessionResourceId,
-          instanceId: authInstance.instanceId,
-          credential: session.credential,
-          storedAt: new Date().toISOString(),
-        } satisfies StoredCloudSessionCredential);
-      }
+      const identity = { mfid, resourceId: sessionResourceId, instanceId: authInstance.instanceId };
+      const session = options.createSession
+        ? await options.createSession(apiBase, authInstance, identity)
+        : await createSessionClient({ apiBase, fetch: fetchImpl, instanceKey: authInstance }).createSession(identity);
       return session.credential;
     };
 
-    const refreshSession = (): Promise<CloudSessionCredential> => {
-      const inFlight = inFlightSessionRefreshes.get(refreshSessionKey);
-      if (inFlight) return inFlight;
-      const promise = performRefreshSession().finally(() => {
-        if (inFlightSessionRefreshes.get(refreshSessionKey) === promise) inFlightSessionRefreshes.delete(refreshSessionKey);
-      });
-      inFlightSessionRefreshes.set(refreshSessionKey, promise);
-      return promise;
+    const refreshSession = async (): Promise<CloudSessionCredential> => {
+      let promise = sessionRefreshes.get(refreshSessionKey);
+      if (!promise) {
+        promise = performRefreshSession().finally(() => {
+          if (sessionRefreshes.get(refreshSessionKey) === promise) sessionRefreshes.delete(refreshSessionKey);
+        });
+        sessionRefreshes.set(refreshSessionKey, promise);
+      }
+      const credential = await promise;
+      const current = await readContext(resourceId);
+      if (!current || current.instanceId !== context.instanceId || current.mfid !== mfid
+        || current.remoteResourceId !== context.remoteResourceId
+        || current.bucketAccessGrant?.grantRecordId !== context.bucketAccessGrant?.grantRecordId) {
+        throw new ClientError("AUTHORIZATION_CHANGED", "Authorization changed while refreshing the session");
+      }
+      await storage.set(sessionKey(sessionResourceId, context.instanceId), {
+        v: 1, mfid, resourceId: sessionResourceId, instanceId: authInstance.instanceId,
+        credential, storedAt: new Date().toISOString(),
+      } satisfies StoredCloudSessionCredential);
+      sessions.set(refreshSessionKey, credential);
+      return credential;
     };
 
     if (!forceRefresh) {
       let cachedCredential: CloudSessionCredential | null = null;
-      if (currentSession?.resourceId === sessionResourceId && isSessionUsable(currentSession.credential)) {
-        cachedCredential = currentSession.credential;
+      const current = sessions.get(refreshSessionKey);
+      if (current && isSessionUsable(current)) {
+        cachedCredential = current;
       } else {
         const stored = await storage.get<StoredCloudSessionCredential>(sessionKey(sessionResourceId, context.instanceId));
         if (
@@ -335,7 +331,7 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
           stored.instanceId === authInstance.instanceId &&
           isSessionUsable(stored.credential)
         ) {
-          currentSession = { resourceId: sessionResourceId, credential: stored.credential };
+          sessions.set(refreshSessionKey, stored.credential);
           cachedCredential = stored.credential;
         }
       }
@@ -345,69 +341,83 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
       }
     }
 
-    if (forceRefresh) inFlightSessionRefreshes.delete(refreshSessionKey);
     return refreshSession();
+  }
+
+  async function prepareAuthorization(request: { bucketId: string }, signal?: AbortSignal): Promise<AuthorizationRequest> {
+    const resourceId = bucketResourceId(requireValidBucketId(request.bucketId));
+    const authInstance = await getInstanceKey();
+    signal?.throwIfAborted();
+    currentResourceId = resourceId;
+    const state = randomId("state");
+    const requestId = randomId("req");
+    const nextPendingKey = pendingAuthKey(resourceId, authInstance.instanceId);
+    const redirectUri = options.redirectUri || browserLocationHref();
+    const createdAt = new Date().toISOString();
+    const fragment = buildAuthRequestFragment({
+      clientId: appId,
+      requestId,
+      state,
+      redirectUri,
+      origin: options.origin || browserLocationOrigin(),
+      resourceId,
+      capabilities: FIXED_CAPABILITIES,
+      instanceId: authInstance.instanceId,
+      instanceSigningPublicJwk: authInstance.signingPublicJwk,
+      instanceWrappingPublicJwk: authInstance.wrappingPublicJwk,
+      createdAt,
+    });
+    const previous = await storage.get<PendingInstanceAuthRequest>(nextPendingKey);
+    signal?.throwIfAborted();
+    await storage.set(nextPendingKey, {
+      redirectUri,
+      v: 1,
+      requestId,
+      state,
+      resourceId,
+      capabilities: FIXED_CAPABILITIES,
+      instanceId: authInstance.instanceId,
+    } satisfies PendingInstanceAuthRequest);
+    if (previous?.requestId) await storage.remove(callbackPointerKey(previous.requestId));
+    await storage.set(callbackPointerKey(requestId), {
+      v: 1,
+      requestId,
+      resourceId,
+      instanceId: authInstance.instanceId,
+      pendingKey: nextPendingKey,
+      createdAt,
+    } satisfies InstanceAuthCallbackPointer);
+    const authPageUrl = String(options.authPageUrl || "").trim();
+    if (!authPageUrl) throw new Error("authPageUrl is required to authorize an instance");
+    const authUrl = `${authPageUrl}${fragment}`;
+    const value = { url: authUrl, requestId, state, resourceId, instanceId: authInstance.instanceId, redirectUri, createdAt };
+    if (signal?.aborted) { await cancelAuthorization(requestId); signal.throwIfAborted(); }
+    return value;
+  }
+  async function cancelAuthorization(requestId: string): Promise<void> {
+    const pointer = await storage.get<InstanceAuthCallbackPointer>(callbackPointerKey(requestId));
+    if (!pointer) return;
+    const pending = await storage.get<PendingInstanceAuthRequest>(pointer.pendingKey);
+    if (pending?.requestId === requestId) await storage.remove(pointer.pendingKey);
+    await storage.remove(callbackPointerKey(requestId));
   }
 
   return {
     async ensureInstance() {
-      return ensureStoredInstance();
+      return getInstanceKey();
     },
+    prepareAuthorization,
+    cancelAuthorization,
     async authorize(request) {
-      const resourceId = bucketResourceId(requireValidBucketId(request.bucketId));
-      const authInstance = await ensureStoredInstance();
-      currentResourceId = resourceId;
-      const state = randomId("state");
-      const requestId = randomId("req");
-      const nextPendingKey = pendingAuthKey(resourceId, authInstance.instanceId);
-      const fragment = buildAuthRequestFragment({
-        clientId: appId,
-        requestId,
-        state,
-        redirectUri: options.redirectUri || browserLocationHref(),
-        origin: options.origin || browserLocationOrigin(),
-        resourceId,
-        capabilities: FIXED_CAPABILITIES,
-        instanceId: authInstance.instanceId,
-        instanceSigningPublicJwk: authInstance.signingPublicJwk,
-        instanceWrappingPublicJwk: authInstance.wrappingPublicJwk,
-        createdAt: new Date().toISOString(),
-      });
-      await storage.set(nextPendingKey, {
-        v: 1,
-        requestId,
-        state,
-        resourceId,
-        capabilities: FIXED_CAPABILITIES,
-        instanceId: authInstance.instanceId,
-      } satisfies PendingInstanceAuthRequest);
-      await storage.set(callbackPointerKey(requestId), {
-        v: 1,
-        requestId,
-        resourceId,
-        instanceId: authInstance.instanceId,
-        pendingKey: nextPendingKey,
-        createdAt: new Date().toISOString(),
-      } satisfies InstanceAuthCallbackPointer);
-      const authPageUrl = String(options.authPageUrl || "").trim();
-      if (!authPageUrl) throw new Error("authPageUrl is required to authorize an instance");
-      const authUrl = `${authPageUrl}${fragment}`;
-      if (options.openAuthUrl) {
-        await options.openAuthUrl(authUrl);
-        return;
-      }
+      const pending = await prepareAuthorization(request);
+      if (options.openAuthUrl) { await options.openAuthUrl(pending.url); return; }
       if (typeof window === "undefined") throw new Error("browser window required for authorize redirect");
-      window.location.href = authUrl;
+      window.location.href = pending.url;
     },
-    async handleCallback(url) {
+    async handleCallback(url, callbackOptions = {}) {
+      const check = () => callbackOptions.signal?.throwIfAborted();
+      check();
       const parsed = url && /^[a-z][a-z0-9+.-]*:/i.test(url) ? new URL(url) : new URL(url || browserLocationHref(), browserLocationOrigin());
-      let encryptedEnvelope: EncryptedAuthAuthorizationResultEnvelope | null = null;
-      let encryptedEnvelopeInvalid = false;
-      try {
-        encryptedEnvelope = parseEncryptedAuthAuthorizationResultFragment(parsed.hash);
-      } catch {
-        encryptedEnvelopeInvalid = true;
-      }
       const result: AuthCallbackResult = {
         requestId: parsed.searchParams.get("mf_request_id") || "",
         state: parsed.searchParams.get("state") || "",
@@ -417,53 +427,75 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
       };
       if (!result.requestId || !result.state || !["approved", "denied", "error"].includes(result.result)) return null;
       const pointer = await storage.get<InstanceAuthCallbackPointer>(callbackPointerKey(result.requestId));
-      if (!pointer || pointer.v !== 1 || pointer.requestId !== result.requestId || !isFresh(pointer.createdAt)) return null;
+      if (!pointer || pointer.v !== 1 || pointer.requestId !== result.requestId) return null;
+      if (!isFresh(pointer.createdAt)) { await cancelAuthorization(result.requestId); return null; }
       const expected = await storage.get<PendingInstanceAuthRequest>(pointer.pendingKey);
       if (!expected || expected.v !== 1 || expected.requestId !== result.requestId || expected.state !== result.state) return null;
+      check();
+      const redirect = new URL(expected.redirectUri || options.redirectUri || browserLocationHref());
+      if (parsed.origin !== redirect.origin || parsed.pathname !== redirect.pathname) throw new ClientError("INVALID_AUTHORIZATION", "Callback destination mismatch");
       result.resourceId = expected.resourceId;
+      async function clearRequest(): Promise<void> {
+        const pending = await storage.get<PendingInstanceAuthRequest>(pointer!.pendingKey);
+        if (pending?.requestId === result.requestId) await storage.remove(pointer!.pendingKey);
+        await storage.remove(callbackPointerKey(result.requestId));
+      }
       if (result.result === "approved") {
-        if (encryptedEnvelopeInvalid || !encryptedEnvelope) {
-          return { ...result, result: "error", error: "server_error", errorDescription: "authorization_result_invalid" };
-        }
         const authInstance = await readStoredInstance(expected.instanceId);
         if (!authInstance) return { ...result, result: "error", error: "server_error", errorDescription: "authorization_instance_missing" };
         let stored: StoredAuthAuthorizationResult;
         try {
-          stored = await decryptEncryptedAuthAuthorizationResult({
-            envelope: encryptedEnvelope,
-            instanceWrappingPrivateKey: authInstance.wrappingPrivateKey,
-            expectedRequestId: result.requestId,
-            expectedState: result.state,
-            expectedResourceId: expected.resourceId,
-            expectedInstanceId: expected.instanceId,
-          });
+          stored = await readAuthorizationResult(parsed, {
+            requestId: expected.requestId, state: expected.state, resourceId: expected.resourceId,
+            instanceId: expected.instanceId,
+          }, authInstance.wrappingPrivateKey);
         } catch {
           return { ...result, result: "error", error: "server_error", errorDescription: "authorization_result_invalid" };
         }
         if (stored.resourceId !== pointer.resourceId || stored.instanceId !== pointer.instanceId) {
           return { ...result, result: "error", error: "server_error", errorDescription: "authorization_context_mismatch" };
         }
+        async function checkIdentity(): Promise<void> {
+          if ((await readActiveStoredInstance())?.instanceId === authInstance!.instanceId) return;
+          await clearRequest();
+          throw new ClientError("IDENTITY_MISMATCH", "Authorization belongs to a different active instance");
+        }
+        check();
+        const authorization = await authorizationContext(stored, authInstance);
+        check();
+        await checkIdentity();
+        if ((await storage.get<PendingInstanceAuthRequest>(pointer.pendingKey))?.requestId !== result.requestId) throw new ClientError("AUTHORIZATION_CANCELLED", "Authorization replaced by a new request");
+        check();
+        options.onIdentity?.(authInstance);
+        check();
+        if (callbackOptions.persist === false) { await clearRequest(); check(); return { ...result, authorization }; }
         const remoteResourceId = stored.bucketAccessGrant?.resourceId || stored.resourceId;
-        mfid = stored.mfid;
-        currentResourceId = stored.resourceId;
-        await storage.set(contextKey(stored.resourceId, stored.instanceId), {
-          v: 1,
-          mfid: stored.mfid,
-          resourceId: stored.resourceId,
+        const nextContext: InstanceAuthContext = {
+          v: 1, mfid: stored.mfid, resourceId: stored.resourceId,
           ...(remoteResourceId !== stored.resourceId ? { remoteResourceId } : {}),
           ...(stored.resourceApiUrl ? { resourceApiUrl: stored.resourceApiUrl } : {}),
-          instanceId: stored.instanceId,
-          requestId: result.requestId,
+          instanceId: stored.instanceId, requestId: result.requestId,
           authorizedAt: new Date().toISOString(),
           ...(stored.bucketAccessGrant ? { bucketAccessGrant: stored.bucketAccessGrant } : {}),
-        } satisfies InstanceAuthContext);
-        await writeStoredInstance(authInstance);
-        if (currentSession?.resourceId === remoteResourceId) currentSession = null;
+        };
+        check();
+        await clearRequest();
+        check();
         await storage.remove(sessionKey(remoteResourceId, stored.instanceId));
+        check();
+        await storage.set(contextKey(stored.resourceId, stored.instanceId), nextContext);
+        if (callbackOptions.signal?.aborted) {
+          const key = contextKey(stored.resourceId, stored.instanceId);
+          if ((await storage.get<InstanceAuthContext>(key))?.requestId === result.requestId) await storage.remove(key);
+          check();
+        }
+        mfid = stored.mfid;
+        currentResourceId = stored.resourceId;
+        sessions.clear();
         bucketAccessCache.clear();
+        return result;
       }
-      await storage.remove(pointer.pendingKey);
-      await storage.remove(callbackPointerKey(result.requestId));
+      await clearRequest();
       return result;
     },
     getContext: (bucketId) => readContext(bucketResourceId(requireValidBucketId(bucketId))),
@@ -472,10 +504,11 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
       const safeBucketId = requireValidBucketId(bucketId);
       const resourceId = bucketResourceId(safeBucketId);
       const context = await readContext(resourceId);
-      if (!mfid || !context) throw new Error("not authorized; complete an auth callback first");
-      const authInstance = await ensureStoredInstance();
+      if (!context) throw new ClientError("NOT_AUTHORIZED", "Authorize this bucket first");
+      const mfid = context.mfid;
+      const authInstance = await getInstanceKey();
       if (authInstance.instanceId !== context.instanceId) throw new Error("stored instance does not match authorization context");
-      const cacheKey = `${mfid}:${safeBucketId}:${authInstance.instanceId}`;
+      const cacheKey = JSON.stringify([mfid, safeBucketId, authInstance.instanceId, context.bucketAccessGrant?.grantRecordId, context.resourceApiUrl]);
       const cached = bucketAccessCache.get(cacheKey);
       if (cached && cached.expiresAt > Date.now()) return cached.access;
       const grant = normalizeBucketAccessGrant(context.bucketAccessGrant);
@@ -484,6 +517,7 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
         throw new Error("bucket access grant unavailable; reauthorize required");
       }
       const keys = await unwrapBucketKeys(grant.envelope, authInstance.wrappingPrivateKey);
+      if (bucketResourceId(keys.bucketId) !== remoteResourceId) throw new ClientError("INVALID_AUTHORIZATION", "Bucket key does not match the authorized resource");
       const access: BucketAccess = {
         mfid,
         instanceId: authInstance.instanceId,
@@ -501,61 +535,15 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
       const resourceId = bucketResourceId(requireValidBucketId(bucketId));
       const authInstance = await readActiveStoredInstance();
       if (authInstance) {
+        const context = await readContext(resourceId);
         await storage.remove(contextKey(resourceId, authInstance.instanceId));
-        await storage.remove(sessionKey(resourceId, authInstance.instanceId));
+        await storage.remove(sessionKey(context?.remoteResourceId || resourceId, authInstance.instanceId));
       }
-      if (currentResourceId === resourceId || !authInstance) {
-        mfid = "";
-        currentResourceId = "";
-        currentSession = null;
-        bucketAccessCache.clear();
-      }
+      if (currentResourceId === resourceId || !authInstance) { mfid = ""; currentResourceId = ""; }
+      sessions.clear();
+      bucketAccessCache.clear();
     },
   };
-}
-
-async function generateAuthInstance(): Promise<AuthInstance> {
-  const signing = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
-  const wrapping = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
-  const signingPublicJwk = (await crypto.subtle.exportKey("jwk", signing.publicKey)) as JsonWebKey;
-  const wrappingPublicJwk = (await crypto.subtle.exportKey("jwk", wrapping.publicKey)) as JsonWebKey;
-  return {
-    v: 1,
-    instanceId: await deriveInstanceId(signingPublicJwk),
-    signingPublicJwk,
-    signingPrivateKey: signing.privateKey,
-    wrappingPublicJwk,
-    wrappingPrivateKey: wrapping.privateKey,
-    createdAt: new Date().toISOString(),
-  };
-}
-
-async function deriveInstanceId(signingPublicJwk: JsonWebKey): Promise<string> {
-  const digest = await sha256Hex(stableStringify(jwkCore(signingPublicJwk)));
-  return `inst_${digest.slice(0, 32)}`;
-}
-
-export async function signInstanceChallenge(input: {
-  instance: Pick<AuthInstance, "instanceId" | "signingPrivateKey">;
-  challenge: string;
-  mfid: string;
-  resourceId: string;
-  challengeId?: string;
-  signedAt?: string;
-}): Promise<InstanceProof> {
-  const signedAt = normalizeIsoDateTime(input.signedAt) || new Date().toISOString();
-  const payload = stableStringify({
-    v: 1,
-    type: "instance-proof",
-    instanceId: input.instance.instanceId,
-    challenge: input.challenge,
-    challengeId: input.challengeId || "",
-    mfid: input.mfid,
-    resourceId: input.resourceId,
-    signedAt,
-  });
-  const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, input.instance.signingPrivateKey, utf8Encode(payload));
-  return { type: "instance.es256", instanceId: input.instance.instanceId, alg: "ES256", signedAt, signature: bytesToB64url(new Uint8Array(signature)) };
 }
 
 type AuthRequestFields = {
@@ -572,7 +560,7 @@ type AuthRequestFields = {
   createdAt: string;
 };
 
-function buildAuthRequestFragment(request: AuthRequestFields): string {
+export function buildAuthRequestFragment(request: AuthRequestFields): string {
   if (!request.requestId || !request.state) throw new Error("auth request state required");
   if (!isValidInstanceId(request.instanceId)) throw new Error("invalid instanceId");
   if (!isPublicP256EcJwk(request.instanceSigningPublicJwk)) throw new Error("instanceSigningPublicJwk required");
@@ -623,6 +611,22 @@ function parseEncryptedAuthAuthorizationResultFragment(fragmentOrUrl: string): E
     throw new Error("auth callback result fragment invalid");
   }
   return envelope as EncryptedAuthAuthorizationResultEnvelope;
+}
+
+export async function readAuthorizationResult(url: URL, expected: {
+  requestId: string; state: string; resourceId: string; instanceId: string;
+}, wrappingPrivateKey: CryptoKey): Promise<StoredAuthAuthorizationResult> {
+  if (url.searchParams.get("mf_request_id") !== expected.requestId || url.searchParams.get("state") !== expected.state) {
+    throw new ClientError("INVALID_AUTHORIZATION", "Authorization callback does not match the request");
+  }
+  if (url.searchParams.get("mf_result") !== "approved") {
+    throw new ClientError("AUTHORIZATION_DENIED", "Authorization was not approved");
+  }
+  const envelope = parseEncryptedAuthAuthorizationResultFragment(url.hash);
+  if (!envelope) throw new ClientError("INVALID_AUTHORIZATION", "Encrypted authorization result is missing");
+  return decryptEncryptedAuthAuthorizationResult({ envelope, instanceWrappingPrivateKey: wrappingPrivateKey,
+    expectedRequestId: expected.requestId, expectedState: expected.state,
+    expectedResourceId: expected.resourceId, expectedInstanceId: expected.instanceId });
 }
 
 export async function decryptEncryptedAuthAuthorizationResult(input: {
@@ -789,19 +793,6 @@ function normalizeCapabilities(input: unknown): AuthCapability[] {
   return result.sort();
 }
 
-async function postJson<T>(fetchImpl: typeof fetch, apiBase: string | undefined, path: string, body: unknown): Promise<T> {
-  const res = await fetchImpl(`${apiBase || ""}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`${path} failed: ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
-  }
-  return (await res.json()) as T;
-}
-
 function getSessionRemainingMs(session: CloudSessionCredential | null): number | null {
   if (!session || session.carrier !== "bearer") return null;
   const expiresAt = Date.parse(session.expiresAt);
@@ -844,7 +835,7 @@ function isValidMfid(value: unknown): value is string {
 function isPublicP256EcJwk(value: unknown): value is JsonWebKey {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const jwk = value as JsonWebKey;
-  return jwk.kty === "EC" && jwk.crv === "P-256" && typeof jwk.x === "string" && jwk.x.length > 0 && typeof jwk.y === "string" && jwk.y.length > 0;
+  return !("d" in jwk) && jwk.kty === "EC" && jwk.crv === "P-256" && typeof jwk.x === "string" && jwk.x.length > 0 && typeof jwk.y === "string" && jwk.y.length > 0;
 }
 
 function normalizeInstanceAppId(value: unknown): string {

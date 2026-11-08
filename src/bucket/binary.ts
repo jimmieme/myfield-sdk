@@ -1,13 +1,25 @@
 import { bytesToB64url } from "../internal/encoding.ts";
 
+/**
+ * Binary input accepted by a local bucket.
+ * @public
+ */
 export type BinaryInput = Blob | ArrayBuffer | Uint8Array;
 
+/**
+ * Application-provided binary metadata.
+ * @public
+ */
 export type BinaryOptions = {
   mimeType?: string;
   name?: string;
   lastModified?: number;
 };
 
+/**
+ * A local binary value handle with lazy body access.
+ * @public
+ */
 export type BucketBinaryValue = {
   readonly kind: "binary";
   readonly size: number;
