@@ -29,7 +29,8 @@ export type BucketIndex = { bucketId: string; objects: FeedHint[]; feedCursor: s
 
 export type BucketKey = { bucketId: string; keyId: string; cryptoKey: CryptoKey };
 
-export interface RemoteBucketClient {
+export interface RemoteBucket {
+  getBucketKey(options?: RequestOptions): Promise<BucketKey>;
   getCurrent(objectId: string, options?: RequestOptions & { knownVersionId?: string | null }): Promise<CurrentVersion | null>;
   getVersion(objectId: string, versionId: string, options?: RequestOptions): Promise<ObjectVersion>;
   getVersionMeta(objectId: string, versionId: string, options?: RequestOptions): Promise<VersionMeta>;
@@ -41,9 +42,7 @@ export interface RemoteBucketClient {
   watchFeed(options?: RequestOptions): Promise<AsyncGenerator<FeedHint>>;
 }
 
-export interface RemoteBucket extends RemoteBucketClient {
-  getBucketKey(options?: RequestOptions): Promise<BucketKey>;
-}
+export type RemoteBucketClient = Omit<RemoteBucket, "getBucketKey">;
 
 function isHistory(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(id => typeof id === "string" && id.length > 0)

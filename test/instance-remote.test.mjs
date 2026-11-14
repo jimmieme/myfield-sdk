@@ -1655,3 +1655,17 @@ test("getBucketKey returns a non-extractable handle for the granted bucket key",
   await instance.disconnect();
   await assert.rejects(remote.getBucketKey(), code("NOT_AUTHORIZED"));
 });
+
+test("getBucketKey follows connection state like other Remote methods", async t => {
+  const env = browser(t), instance = env.instance(), remote = instance.remote.getBucket();
+  const connecting = instance.connect({ autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  await assert.rejects(remote.getBucketKey(), code("NOT_AUTHORIZED"));
+  await env.approve(); await connecting;
+  assert.ok((await remote.getBucketKey()).cryptoKey);
+  env.setHandler(() => Response.json({ code: "GRANT_REVOKED" }, { status: 403 }));
+  await assert.rejects(remote.getCurrent("note"), code("NOT_AUTHORIZED"));
+  await assert.rejects(remote.getBucketKey(), code("NOT_AUTHORIZED"));
+  stop(instance);
+  await assert.rejects(remote.getBucketKey(), code("INVALID_STATE"));
+});

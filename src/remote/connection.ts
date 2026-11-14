@@ -341,11 +341,15 @@ export function createInstanceConnection(deps: {
     } };
   }
 
-  async function invoke<T>(operation: (bucket: RemoteBucketClient) => Promise<T>): Promise<T> {
+  function requireConnection() {
     assertUsable();
-    if (!remoteClient || !connectionController) throw notAuthorized("Call instance.connect() before Remote operations");
-    const client = remoteClient;
-    return handleOperation(connectionController, () => operation(client.getBucket()));
+    if (!remoteClient || !connectionController || !localAccess) throw notAuthorized("Call instance.connect() before Remote operations");
+    return { client: remoteClient, controller: connectionController, access: localAccess.access };
+  }
+
+  async function invoke<T>(operation: (bucket: RemoteBucketClient) => Promise<T>): Promise<T> {
+    const { client, controller } = requireConnection();
+    return handleOperation(controller, () => operation(client.getBucket()));
   }
 
   async function handleOperation<T>(controller: AbortController, operation: () => Promise<T>): Promise<T> {
@@ -362,10 +366,8 @@ export function createInstanceConnection(deps: {
 
   const remote: RemoteBucket = {
     async getBucketKey(options) {
-      assertUsable();
       options?.signal?.throwIfAborted();
-      if (!remoteClient || !localAccess) throw notAuthorized("Call instance.connect() before Remote operations");
-      const { access } = localAccess;
+      const { access } = requireConnection();
       return { bucketId: access.bucketId, keyId: access.keys.keyId, cryptoKey: access.keys.payloadKey };
     },
     getCurrent: (...args) => invoke(bucket => bucket.getCurrent(...args)),
@@ -377,10 +379,7 @@ export function createInstanceConnection(deps: {
     listFeed: (...args) => invoke(bucket => bucket.listFeed(...args)),
     listVersions: (...args) => invoke(bucket => bucket.listVersions(...args)),
     async watchFeed(options) {
-      assertUsable();
-      if (!remoteClient || !connectionController) throw notAuthorized("Call instance.connect() before Remote operations");
-      const controller = connectionController;
-      const client = remoteClient;
+      const { client, controller } = requireConnection();
       const stream = await handleOperation(controller, () => client.getBucket().watchFeed(options)).catch(error => {
         controller.signal.throwIfAborted();
         throw error;
