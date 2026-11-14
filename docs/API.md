@@ -256,18 +256,13 @@ retaining keys and objects.
 `commit()` submits app-encoded metadata and encrypted bytes against
 `expectedHeadVersionId`; null requests creation. The app owns encryption and merge.
 
-`getBucketKey()` returns `{ bucketId, keyId, cryptoKey }` for the connected bucket, so
-apps can encrypt with the granted bucket key. `bucketId` is the remote ID used in API
-paths; `cryptoKey` is a non-extractable AES-GCM-256 key for encrypt/decrypt.
-- It is the same key Local uses for its sync payloads. If one bucket mixes Local and
-  Remote data, use an AAD format of your own so the two cannot be confused.
-- Store `keyId` with your ciphertext. Only the current key is available and key
-  rotation is not supported; treat data under another `keyId` as unreadable, not
-  corrupt.
-- It makes no request, so it cannot see a server-side revocation until another Remote
-  call fails authorization. Do not persist the handle; get it again after each connect.
-- It rejects with `NOT_AUTHORIZED` when not connected, `AbortError` for an aborted
-  signal and `INVALID_STATE` after the runtime stops.
+`getBucketKey()` returns `{ bucketId, keyId, cryptoKey }` for encrypting Remote
+payloads: the remote bucket ID used in API paths and the granted key as a
+non-extractable AES-GCM-256 `CryptoKey`, shared with Local sync. Use your own AAD,
+store `keyId` with ciphertext (no rotation yet), and get the handle again after each
+connect instead of persisting it. It makes no request, so revocation shows up only
+after another Remote call fails. Rejections: `NOT_AUTHORIZED`, `AbortError`,
+`INVALID_STATE`.
 
 CAS rejection returns `{ok:false, reason}`; other failures throw `ClientError`.
 After an uncertain failure, preserve version IDs, bytes and local edits.

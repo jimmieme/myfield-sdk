@@ -44,8 +44,8 @@ Full API reference: [`docs/API.md`](docs/API.md).
 
 `instance.remote.getBucket()` provides object reads, CAS commits, version history and
 change notifications with the instance's authorization; the app owns payload encryption
-and local storage. Encrypt with the granted key from `getBucketKey()` and upload
-ciphertext only. See [Remote Object API](docs/API.md#remote-object-api).
+and local storage, encrypting with `getBucketKey()`. See
+[Remote Object API](docs/API.md#remote-object-api).
 
 ## What the SDK handles
 
@@ -58,8 +58,7 @@ ciphertext only. See [Remote Object API](docs/API.md#remote-object-api).
   different aliases and cannot correlate users across apps.
 - **Encryption**: Local payloads are encrypted client-side; the platform stores
   ciphertext only. Object ids are blinded — your semantic ids
-  (`note:1`, `note:list`) never reach the wire. Remote apps encrypt their own
-  payloads with `getBucketKey()`.
+  (`note:1`, `note:list`) never reach the wire. Remote apps encrypt their own payloads.
 - **Merge**: objects are field maps with last-write-wins per field
   (a state-based CRDT), so multi-device edits converge without conflicts
   surfacing to the app. Custom merge strategies (e.g. Yjs documents) can be
