@@ -256,6 +256,12 @@ retaining keys and objects.
 `commit()` submits app-encoded metadata and encrypted bytes against
 `expectedHeadVersionId`; null requests creation. The app owns encryption and merge.
 
+`getBucketKey()` returns `{ bucketId, keyId, cryptoKey }` for the connected bucket, so
+apps can encrypt with the granted bucket key. `bucketId` is the remote ID used in API
+paths; `cryptoKey` is a non-extractable AES-GCM-256 key for encrypt/decrypt. It rejects
+with `NOT_AUTHORIZED` when not connected. Do not persist the handle; get it again
+after each connect. Only the current key is available.
+
 CAS rejection returns `{ok:false, reason}`; other failures throw `ClientError`.
 After an uncertain failure, preserve version IDs, bytes and local edits.
 All Remote requests support cancellation with `{ signal }` and do not automatically retry.

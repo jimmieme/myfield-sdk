@@ -7,7 +7,7 @@ import type { StorageAdapter } from "../bucket/store.ts";
 import { ClientError, REVOKED_AUTHORIZATION_CODES } from "../errors.ts";
 import { createHttpRequest } from "./http.ts";
 import { createRemoteClient, type RemoteClient } from "./client.ts";
-import type { RemoteBucket, FeedHint } from "./bucket.ts";
+import type { RemoteBucket, RemoteBucketClient, FeedHint } from "./bucket.ts";
 import type { BucketAccess } from "../auth/types.ts";
 
 const DEFAULT_AUTH_URL = "https://myfield.one/auth/";
@@ -341,7 +341,7 @@ export function createInstanceConnection(deps: {
     } };
   }
 
-  async function invoke<T>(operation: (bucket: RemoteBucket) => Promise<T>): Promise<T> {
+  async function invoke<T>(operation: (bucket: RemoteBucketClient) => Promise<T>): Promise<T> {
     assertUsable();
     if (!remoteClient || !connectionController) throw notAuthorized("Call instance.connect() before Remote operations");
     const client = remoteClient;
@@ -361,6 +361,13 @@ export function createInstanceConnection(deps: {
   }
 
   const remote: RemoteBucket = {
+    async getBucketKey(options) {
+      assertUsable();
+      options?.signal?.throwIfAborted();
+      if (!remoteClient || !localAccess) throw notAuthorized("Call instance.connect() before Remote operations");
+      const { access } = localAccess;
+      return { bucketId: access.bucketId, keyId: access.keys.keyId, cryptoKey: access.keys.payloadKey };
+    },
     getCurrent: (...args) => invoke(bucket => bucket.getCurrent(...args)),
     getVersion: (...args) => invoke(bucket => bucket.getVersion(...args)),
     getVersionMeta: (...args) => invoke(bucket => bucket.getVersionMeta(...args)),

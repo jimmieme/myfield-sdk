@@ -1631,3 +1631,27 @@ test("every bucket of an Instance uses its authUrl", async t => {
   assert.equal(await grantedApiOrigin(env.auth, env.namespace, "archive.example.com"), "https://api.example.test");
 });
 
+
+test("getBucketKey returns a non-extractable handle for the granted bucket key", async t => {
+  const env = browser(t), instance = env.instance(), remote = instance.remote.getBucket();
+  await assert.rejects(remote.getBucketKey(), code("NOT_AUTHORIZED"));
+  const connecting = instance.connect({ autoSync: false });
+  const { rawBucketKey } = await env.approve({ remoteBucketId: "remote.example.com" });
+  await connecting;
+  const { bucketId, keyId, cryptoKey } = await remote.getBucketKey();
+  assert.equal(bucketId, "remote.example.com");
+  assert.match(keyId, /^bk_/);
+  assert.equal(cryptoKey.extractable, false);
+  assert.equal(cryptoKey.algorithm.name, "AES-GCM");
+  assert.deepEqual([...cryptoKey.usages].sort(), ["decrypt", "encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, cryptoKey, new TextEncoder().encode("card"));
+  const raw = await crypto.subtle.importKey("raw", rawBucketKey, "AES-GCM", false, ["decrypt"]);
+  assert.equal(new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, raw, sealed)), "card");
+  await remote.getCurrent("note");
+  assert.ok(env.calls.at(-1).url.pathname.includes(`/buckets/${bucketId}/`));
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(remote.getBucketKey({ signal: controller.signal }), error => error.name === "AbortError");
+  await instance.disconnect();
+  await assert.rejects(remote.getBucketKey(), code("NOT_AUTHORIZED"));
+});
